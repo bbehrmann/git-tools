@@ -18,6 +18,7 @@ STALE_DAYS=$DEFAULT_STALE_DAYS
 CHECK_PRS=false
 GITHUB_TOKEN=""
 DRY_RUN=false
+SCAN_REMOTE=false
 REPOS=()
 EXCLUDE_BRANCHES="main|master|develop|dev"
 
@@ -31,7 +32,8 @@ USAGE:
 OPTIONS:
     -d, --days DAYS         Number of days to consider a branch stale (default: $DEFAULT_STALE_DAYS)
     -p, --check-prs         Check for active pull requests (requires GitHub token)
-    -t, --token TOKEN       GitHub token for PR checking
+    -r, --remote            Also scan remote branches on GitHub server
+    -t, --token TOKEN       GitHub token for PR checking and remote scanning
     -n, --dry-run          Show what would be deleted without actually deleting
     -e, --exclude PATTERN   Regex pattern for branches to exclude (default: $EXCLUDE_BRANCHES)
     -c, --config FILE       Use config file (default: $DEFAULT_CONFIG_FILE)
@@ -46,6 +48,9 @@ EXAMPLES:
 
     # Check for active PRs before suggesting deletion
     git-branch-cleaner -p -t ghp_your_token_here
+
+    # Scan both local and remote branches
+    git-branch-cleaner -r -t ghp_your_token_here
 
     # Dry run to see what would be deleted
     git-branch-cleaner -n
@@ -93,7 +98,8 @@ get_stale_branches() {
         return 1
     fi
     
-    log "Finding branches older than $cutoff_date in $repo_path"
+    # Log to stderr to avoid contaminating the output pipeline
+    log "Finding branches older than $cutoff_date in $repo_path" >&2
     
     # Get all local branches with their last commit dates, excluding protected branches
     git -C "$repo_path" for-each-ref --format='%(refname:short)|%(committerdate:short)|%(authorname)' refs/heads/ | \
@@ -110,15 +116,8 @@ get_stale_branches() {
     done
 }
 
-check_pr_status() {
+get_repo_info() {
     local repo_path="$1"
-    local branch="$2"
-    
-    if [[ "$CHECK_PRS" == false ]] || [[ -z "$GITHUB_TOKEN" ]]; then
-        return 1  # No PR check or no token
-    fi
-    
-    # Extract repo info from git remote
     local remote_url
     remote_url=$(git -C "$repo_path" remote get-url origin 2>/dev/null || echo "")
     
@@ -127,10 +126,26 @@ check_pr_status() {
     fi
     
     # Parse GitHub repo from URL
-    local repo_info
     if [[ "$remote_url" =~ github.com[:/]([^/]+)/([^/.]+) ]]; then
-        repo_info="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
-    else
+        echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+        return 0
+    fi
+    
+    return 1
+}
+
+check_pr_status() {
+    local repo_path="$1"
+    local branch="$2"
+    
+    if [[ "$CHECK_PRS" == false ]] || [[ -z "$GITHUB_TOKEN" ]]; then
+        return 1  # No PR check or no token
+    fi
+    
+    local repo_info
+    repo_info=$(get_repo_info "$repo_path")
+    
+    if [[ -z "$repo_info" ]]; then
         return 1
     fi
     
@@ -143,10 +158,59 @@ check_pr_status() {
     [[ "$pr_count" -gt 0 ]]
 }
 
+get_remote_stale_branches() {
+    local repo_path="$1"
+    
+    if [[ "$SCAN_REMOTE" == false ]] || [[ -z "$GITHUB_TOKEN" ]]; then
+        return 0
+    fi
+    
+    local repo_info
+    repo_info=$(get_repo_info "$repo_path")
+    
+    if [[ -z "$repo_info" ]]; then
+        warn "Cannot scan remote branches: not a GitHub repository" >&2
+        return 0
+    fi
+    
+    log "Scanning remote branches on GitHub for $repo_info" >&2
+    
+    local cutoff_date
+    cutoff_date=$(date -d "$STALE_DAYS days ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -v-${STALE_DAYS}d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+    
+    if [[ -z "$cutoff_date" ]]; then
+        error "Failed to calculate cutoff date for remote scan"
+        return 1
+    fi
+    
+    # Get all branches from GitHub API
+    curl -s -H "Authorization: token $GITHUB_TOKEN" \
+        "https://api.github.com/repos/$repo_info/branches?per_page=100" | \
+    jq -r '.[] | "\(.name)|\(.commit.commit.committer.date)|\(.commit.commit.committer.name)"' 2>/dev/null | \
+    while IFS='|' read -r branch date author; do
+        # Skip excluded branches
+        if [[ "$branch" =~ ^($EXCLUDE_BRANCHES)$ ]]; then
+            continue
+        fi
+        
+        # Check if branch is stale (convert ISO date to comparable format)
+        local branch_date
+        branch_date=$(date -d "$date" +%Y-%m-%d 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$date" +%Y-%m-%d 2>/dev/null)
+        
+        if [[ -n "$branch_date" ]] && [[ "$branch_date" < "${cutoff_date:0:10}" ]]; then
+            # Check if this branch exists locally
+            if ! git -C "$repo_path" show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null; then
+                echo "remote:$branch|$branch_date|$author"
+            fi
+        fi
+    done
+}
+
 select_branches_to_delete() {
     local repo_path="$1"
     local stale_branches=("${@:2}")
     local selected_branches=()
+    local selected_remote_branches=()
     
     if [[ ${#stale_branches[@]} -eq 0 ]]; then
         log "No stale branches found in $repo_path"
@@ -159,22 +223,38 @@ select_branches_to_delete() {
     
     local i=1
     local branch_info=()
+    local remote_branch_info=()
     
     for branch_data in "${stale_branches[@]}"; do
         IFS='|' read -r branch date author <<< "$branch_data"
         
-        local pr_status=""
-        if check_pr_status "$repo_path" "$branch"; then
-            pr_status=" ${GREEN}(has open PR)${NC}"
-            continue  # Skip branches with open PRs
+        # Handle remote branches
+        if [[ "$branch" =~ ^remote:(.+)$ ]]; then
+            local actual_branch="${BASH_REMATCH[1]}"
+            local pr_status=""
+            if check_pr_status "$repo_path" "$actual_branch"; then
+                pr_status=" ${GREEN}(has open PR)${NC}"
+                continue  # Skip branches with open PRs
+            fi
+            
+            echo -e "$i) ${BLUE}[REMOTE]${NC} $actual_branch (last commit: $date by $author)$pr_status"
+            remote_branch_info+=("$actual_branch")
+            ((i++))
+        else
+            # Handle local branches
+            local pr_status=""
+            if check_pr_status "$repo_path" "$branch"; then
+                pr_status=" ${GREEN}(has open PR)${NC}"
+                continue  # Skip branches with open PRs
+            fi
+            
+            echo -e "$i) $branch (last commit: $date by $author)$pr_status"
+            branch_info+=("$branch")
+            ((i++))
         fi
-        
-        echo -e "$i) $branch (last commit: $date by $author)$pr_status"
-        branch_info+=("$branch")
-        ((i++))
     done
     
-    if [[ ${#branch_info[@]} -eq 0 ]]; then
+    if [[ ${#branch_info[@]} -eq 0 ]] && [[ ${#remote_branch_info[@]} -eq 0 ]]; then
         log "All stale branches have open PRs, nothing to delete"
         return 0
     fi
@@ -183,6 +263,18 @@ select_branches_to_delete() {
     echo "Enter branch numbers to delete (e.g., 1,3,5 or 1-3 or 'all' or 'none'):"
     read -r selection
     
+    # Combine local and remote branch info for selection
+    local all_branch_info=("${branch_info[@]}" "${remote_branch_info[@]}")
+    local all_branch_types=()
+    
+    # Track which branches are local vs remote
+    for ((j=0; j<${#branch_info[@]}; j++)); do
+        all_branch_types+=("local")
+    done
+    for ((j=0; j<${#remote_branch_info[@]}; j++)); do
+        all_branch_types+=("remote")
+    done
+    
     case "$selection" in
         "none"|"")
             log "No branches selected for deletion"
@@ -190,43 +282,66 @@ select_branches_to_delete() {
             ;;
         "all")
             selected_branches=("${branch_info[@]}")
+            selected_remote_branches=("${remote_branch_info[@]}")
             ;;
         *"-"*)
             # Range selection (e.g., 1-3)
             local start end
             IFS='-' read -r start end <<< "$selection"
-            for ((j=start; j<=end && j<=${#branch_info[@]}; j++)); do
-                selected_branches+=("${branch_info[$((j-1))]}")
+            for ((j=start; j<=end && j<=${#all_branch_info[@]}; j++)); do
+                local idx=$((j-1))
+                if [[ "${all_branch_types[$idx]}" == "local" ]]; then
+                    selected_branches+=("${all_branch_info[$idx]}")
+                else
+                    selected_remote_branches+=("${all_branch_info[$idx]}")
+                fi
             done
             ;;
         *","*)
             # Comma-separated selection
             IFS=',' read -ra indices <<< "$selection"
             for index in "${indices[@]}"; do
-                if [[ "$index" =~ ^[0-9]+$ ]] && [[ "$index" -ge 1 ]] && [[ "$index" -le ${#branch_info[@]} ]]; then
-                    selected_branches+=("${branch_info[$((index-1))]}")
+                if [[ "$index" =~ ^[0-9]+$ ]] && [[ "$index" -ge 1 ]] && [[ "$index" -le ${#all_branch_info[@]} ]]; then
+                    local idx=$((index-1))
+                    if [[ "${all_branch_types[$idx]}" == "local" ]]; then
+                        selected_branches+=("${all_branch_info[$idx]}")
+                    else
+                        selected_remote_branches+=("${all_branch_info[$idx]}")
+                    fi
                 fi
             done
             ;;
         *)
             # Single number
-            if [[ "$selection" =~ ^[0-9]+$ ]] && [[ "$selection" -ge 1 ]] && [[ "$selection" -le ${#branch_info[@]} ]]; then
-                selected_branches+=("${branch_info[$((selection-1))]}")
+            if [[ "$selection" =~ ^[0-9]+$ ]] && [[ "$selection" -ge 1 ]] && [[ "$selection" -le ${#all_branch_info[@]} ]]; then
+                local idx=$((selection-1))
+                if [[ "${all_branch_types[$idx]}" == "local" ]]; then
+                    selected_branches+=("${all_branch_info[$idx]}")
+                else
+                    selected_remote_branches+=("${all_branch_info[$idx]}")
+                fi
             fi
             ;;
     esac
     
-    if [[ ${#selected_branches[@]} -eq 0 ]]; then
+    if [[ ${#selected_branches[@]} -eq 0 ]] && [[ ${#selected_remote_branches[@]} -eq 0 ]]; then
         log "No valid branches selected"
         return 0
     fi
     
     echo
     echo -e "${RED}Selected branches for deletion:${NC}"
-    printf '%s\n' "${selected_branches[@]}"
+    if [[ ${#selected_branches[@]} -gt 0 ]]; then
+        echo "Local branches:"
+        printf '  %s\n' "${selected_branches[@]}"
+    fi
+    if [[ ${#selected_remote_branches[@]} -gt 0 ]]; then
+        echo "Remote branches:"
+        printf '  %s\n' "${selected_remote_branches[@]}"
+    fi
     
     if [[ "$DRY_RUN" == true ]]; then
-        warn "DRY RUN: Would delete ${#selected_branches[@]} branches"
+        warn "DRY RUN: Would delete $((${#selected_branches[@]} + ${#selected_remote_branches[@]})) branches"
         return 0
     fi
     
@@ -236,7 +351,12 @@ select_branches_to_delete() {
     read -r confirmation
     
     if [[ "$confirmation" == "yes" ]]; then
-        delete_branches "$repo_path" "${selected_branches[@]}"
+        if [[ ${#selected_branches[@]} -gt 0 ]]; then
+            delete_branches "$repo_path" "${selected_branches[@]}"
+        fi
+        if [[ ${#selected_remote_branches[@]} -gt 0 ]]; then
+            delete_remote_branches "$repo_path" "${selected_remote_branches[@]}"
+        fi
     else
         log "Deletion cancelled"
     fi
@@ -249,14 +369,57 @@ delete_branches() {
     
     for branch in "${branches[@]}"; do
         if git -C "$repo_path" branch -D "$branch" >/dev/null 2>&1; then
-            success "Deleted branch: $branch"
+            success "Deleted local branch: $branch"
             ((deleted_count++))
         else
-            error "Failed to delete branch: $branch"
+            error "Failed to delete local branch: $branch"
         fi
     done
     
-    success "Deleted $deleted_count out of ${#branches[@]} branches in $repo_path"
+    success "Deleted $deleted_count out of ${#branches[@]} local branches in $repo_path"
+}
+
+delete_remote_branches() {
+    local repo_path="$1"
+    local branches=("${@:2}")
+    local deleted_count=0
+    
+    if [[ -z "$GITHUB_TOKEN" ]]; then
+        error "GitHub token required for remote branch deletion"
+        return 1
+    fi
+    
+    local repo_info
+    repo_info=$(get_repo_info "$repo_path")
+    
+    if [[ -z "$repo_info" ]]; then
+        error "Cannot delete remote branches: not a GitHub repository"
+        return 1
+    fi
+    
+    for branch in "${branches[@]}"; do
+        if curl -s -X DELETE -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$repo_info/git/refs/heads/$branch" | \
+            jq -e '.message' >/dev/null 2>&1; then
+            
+            # Check if deletion was successful (GitHub API returns error message if failed)
+            local response
+            response=$(curl -s -X DELETE -H "Authorization: token $GITHUB_TOKEN" \
+                "https://api.github.com/repos/$repo_info/git/refs/heads/$branch")
+            
+            if [[ "$response" =~ "Not Found" ]] || [[ -z "$response" ]]; then
+                success "Deleted remote branch: $branch"
+                ((deleted_count++))
+            else
+                error "Failed to delete remote branch: $branch"
+            fi
+        else
+            success "Deleted remote branch: $branch"
+            ((deleted_count++))
+        fi
+    done
+    
+    success "Deleted $deleted_count out of ${#branches[@]} remote branches in $repo_info"
 }
 
 process_repo() {
@@ -275,11 +438,15 @@ process_repo() {
         git -C "$repo_path" fetch --all --prune >/dev/null 2>&1 || warn "Failed to fetch from remotes"
     fi
     
-    # Get stale branches
-    local stale_branches
+    # Get stale branches (local and remote)
+    local stale_branches remote_stale_branches all_stale_branches
     mapfile -t stale_branches < <(get_stale_branches "$repo_path")
+    mapfile -t remote_stale_branches < <(get_remote_stale_branches "$repo_path")
     
-    select_branches_to_delete "$repo_path" "${stale_branches[@]}"
+    # Combine local and remote stale branches
+    all_stale_branches=("${stale_branches[@]}" "${remote_stale_branches[@]}")
+    
+    select_branches_to_delete "$repo_path" "${all_stale_branches[@]}"
 }
 
 main() {
@@ -294,6 +461,10 @@ main() {
                 ;;
             -p|--check-prs)
                 CHECK_PRS=true
+                shift
+                ;;
+            -r|--remote)
+                SCAN_REMOTE=true
                 shift
                 ;;
             -t|--token)
@@ -351,6 +522,7 @@ main() {
     log "Git Branch Cleaner starting..."
     log "Stale threshold: $STALE_DAYS days"
     log "Check PRs: $CHECK_PRS"
+    log "Scan remote: $SCAN_REMOTE"
     log "Dry run: $DRY_RUN"
     
     # Process each repository
